@@ -9,7 +9,8 @@
             [fipp.clojure :as f]
             [cheshire.core :refer [generate-string parse-string]]
             [camel-snake-kebab.core :refer :all]
-            [gogolica.gen.model :as model]))
+            [gogolica.gen.model :as model]
+            [gogolica.gen.model.method :as method]))
 
 (defn generate-ns-declaration
   "Generates the ns declaration for the given API model."
@@ -33,17 +34,9 @@
 (defn generate-global-vars
   "Generates global variables that are used throughout the generated
    namespace for the given API model"
-  [{root-url :rootUrl
-    service-path :servicePath}]
-  `[(def ~'root-url ~root-url)
-    (def ~'base-url ~(str root-url service-path))])
-
-(defn generate-function-name
-  "Generates a symbol in the form of 'verb-resource', from a method id."
-  [id]
-  (let [[_ resource-name method-name] (str/split id #"\.")]
-    (-> (str resource-name "-" method-name)
-        ->kebab-case-symbol)))
+  [model]
+  `[(def ~'root-url ~(model/root-url model))
+    (def ~'base-url ~(model/base-url model))])
 
 (defn generate-docs [method]
   (str (:description method)
@@ -54,14 +47,10 @@
   to generate the arguments vector.
   If the request is not nil, then the method also takes a request object,
   that gets specified as the first parameter."
-  [{parameters :parameters
-    parameter-order :parameterOrder
+  [{parameter-order :parameterOrder
     request :request
-    media-upload :mediaUpload
-    media-download :supportsMediaDownload}]
-  (let [[required optional] (->> parameters
-                                 (merge (when media-download
-                                          {:alt {:position "query"}}))
+    :as method}]
+  (let [[required optional] (->> method method/parameters
                                  model/split-required-params
                                  (mapv (comp (partial mapv ->kebab-case-symbol) keys)))
         ;; parameter-order also contains the required params, so we get them from there
@@ -71,60 +60,18 @@
         required (if request-sym
                    (cons request-sym required)
                    required)
-        required (if media-upload
+        required (if (method/media-upload? method)
                    (cons 'file-path required)
                    required)]
     `[~@required ~(hash-map :keys optional :as 'optional-params)]))
 
 
-(defn template->path-vector
-  [path-template arg-names]
-  (let [args->symbols (->> arg-names
-                           (mapv #(hash-map % (->kebab-case-symbol %)))
-                           (apply merge))
-        ;; Returns a list of vectors, where the first element is the match including
-        ;; the curly brackets, and the second element is without.
-        matches (re-seq #"\{(.+?)\}" path-template)
-        ;; Helper function in which we iterate on the template string,
-        ;; matching on the first pair of curly braces and adding the
-        ;; match to the accumulator vector, recurring on more matches
-        template->path-vector'
-        (fn [result-acc template matches]
-          (if-some [[match arg] (first matches)]
-            (let [[pre post] (str/split template (re-pattern (str "\\{" arg "\\}")))]
-              (recur (concat result-acc [pre (get args->symbols arg)])
-                     post
-                     (rest matches)))
-            (if template ;; we have no matches anymore, but there might be some string still
-              (concat result-acc [template])
-              result-acc)))]
-    (template->path-vector' [] path-template matches)))
-
-(defn generate-path
-  [template-uri parameters]
-  (template->path-vector template-uri
-                         (->> parameters
-                              (filter (fn [[k v]](= "path" (:location v))))
-                              keys
-                              (mapv name))))
-
 ;; TODO: refactor this crap
 (defn generate-request
   "Generates the request map to be passed to the http library.
   NB: uses the `base-url` symbol, it should be generated in the ns including the method."
-  [{http-method :httpMethod
-    path :path
-    parameters :parameters
-    request :request
-    media-upload :mediaUpload
-    media-download :supportsMediaDownload}]
-  (let [query-params (->> parameters
-                          (merge (when media-download
-                                   {:alt {:location "query"}}))
-                          (filter (fn [[_ v]] (= (:location v) "query")))
-                          (mapv   (fn [[k _]] (name k))))
-        method (-> http-method str/lower-case keyword)
-        ;; If there's a :request key in the model, we take the clojure map
+  [method]
+  (let [;; If there's a :request key in the model, we take the clojure map
         ;; that should be passed as the object, convert it to json, and
         ;; attach it to the body.
         ;; But if there's a mediaUpload key then we should upload a file, so the
@@ -134,28 +81,31 @@
         ;; reading from `path`. To be fixed when we 1. start using schemas, and
         ;; 2. implement Multipart or Resumable upload.
         body (cond
-               media-upload `(clojure.java.io/input-stream ~'file-path)
-               request `(~'generate-string ~(->kebab-case-symbol (get request :$ref)))
+               (method/media-upload? method) `(clojure.java.io/input-stream ~'file-path)
+               (:request method) `(~'generate-string ~(method/body-ident method))
                :else "")]
-    {:method method
+    {:method (method/http-method method)
      ;; Generate code to build the query params map with only the parameters
      ;; that are not nil (so have been passed in)
-     :query-params `(~'?assoc ~(if media-upload
-                                 {"uploadType" "media"}
-                                 {})
-                              ~@(mapcat (fn [p] [p (->kebab-case-symbol p)])
-                                        query-params))
-     :url (if media-upload
+     :query-params `(~'?assoc
+                     ~(if (method/media-upload? method)
+                        {:uploadType "media"}
+                        {})
+                     ~@(->> method method/query-parameters
+                            (mapcat
+                             (fn [[param-name _]]
+                               [param-name
+                                (->kebab-case-symbol param-name)]))))
+     :url (if (method/media-upload? method)
             `(~'str ~'root-url
-                    ~@(generate-path (-> media-upload :protocols :simple :path)
-                                     parameters))
+                    ~@(method/simple-upload-path method))
             `(~'str ~'base-url
-                    ~@(generate-path path parameters)))
-     :content-type (if media-upload
+                    ~@(method/path method)))
+     :content-type (if (method/media-upload? method)
                      `(java.net.URLConnection/guessContentTypeFromStream ~body)
                      :json)
      ;; Auto coercion of return types nicely provided by clj-http
-     :as (if media-download
+     :as (if (method/media-download? method)
            `(~'if (~'= ~'alt "media")
              :byte-array
              :json)
@@ -163,8 +113,8 @@
      :body body}))
 
 (defn generate-function-from-method
-  [{:keys [id scopes] :as method}]
-  `(~'defn ~(generate-function-name id)
+  [{:keys [scopes] :as method}]
+  `(~'defn ~(method/function-name method)
      ~(generate-docs method)
      ~(generate-args method)
      ;(~'println ~(generate-request method))
@@ -183,11 +133,9 @@
   [model]
   (let [ns-declaration (generate-ns-declaration model)
         global-vars (generate-global-vars model)
-        functions (->> (:resources model)
-                       (mapcat
-                        (fn [[resource-id resource]]
-                          (for [[method-id method] (:methods resource)]
-                            (generate-function-from-method method)))))]
+        functions (->> model
+                       model/all-methods
+                       (map generate-function-from-method))]
     (->> (concat
           [ns-declaration]
           global-vars
